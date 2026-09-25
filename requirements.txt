@@ -2,3 +2,4 @@ aerosandbox
 openmdao
 openaerostruct
 openconcept
+plotly
