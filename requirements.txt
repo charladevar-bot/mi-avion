@@ -1,1 +1,4 @@
-aerosandbox, openmdao, openaerostruct, openconcept.
+aerosandbox
+openmdao
+openaerostruct
+openconcept
