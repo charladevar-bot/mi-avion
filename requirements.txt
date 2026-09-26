@@ -6,3 +6,11 @@ plotly
 ruff
 # SUAVE (desglose de pesos): git clone https://github.com/suavecode/SUAVE.git
 #   cd SUAVE/trunk && pip install --no-build-isolation -e .
+
+# --- Modelado CAD (build_step.py) ---
+# FreeCAD no pudo instalarse en este entorno: apt (mirrors Debian), conda-forge,
+# assets de GitHub, SourceForge, freecad.org y Flathub están bloqueados por red,
+# y PyPI no publica el paquete. Se usa build123d + OCP (OpenCASCADE), el mismo
+# kernel B-rep que alimenta a FreeCAD: loft, booleanos y export STEP ISO-10303.
+build123d
+matplotlib
