@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Dimensionamiento clase I + estimación de prestaciones de un avión de
 pasajeros regional turbohélice (30–90 pasajeros, una sola clase).
@@ -26,13 +25,34 @@ Método
   distancia de despegue (potencia total y caso motor inoperante) y de
   aterrizaje, comparadas contra las pistas de SABE y SAAR.
 
+Pesos, balance y bodega (esta versión)
+--------------------------------------
+* Desglose de pesos por componente con SUAVE 2.5.2 (suavecode/SUAVE
+  instalado desde GitHub): correlaciones General_Aviation (Raymer) para
+  fuselaje, alas, colas, tren y sistemas (con desglose hidráulica /
+  eléctrica / aviónica / amueblado / sistema de combustible). El total
+  se escala con un único factor para reconciliar con el OEW de diseño
+  conservador (la correlación GA subestima fuselajes presurizados de
+  >20 m); factor y total sin escala se muestran en el reporte. Si SUAVE
+  no está disponible se usa el desglose manual de respaldo.
+* Centro de gravedad en tres casos de carga (vacío, 90 pax sin
+  equipaje, y 90 pax + equipaje máx. + combustible lleno), verificado
+  contra el rango 15–35 % de la MAC; si algún caso queda fuera, la
+  posición del ala se itera hasta que los tres entren (motores, tren y
+  salidas sobre el ala se desplazan con el ala).
+* Bodega de equipaje bajo el piso: 4,5 m³ (90 × 0,05 m³), ubicada lo
+  más cerca posible del CG con la menor interferencia con la caja del
+  ala; se marca en las vistas.
+
 Uso:  .venv/bin/python sizing_regional.py
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+from suave_pesos import desglose_pesos
 
 G = 9.80665  # m/s²
 RHO_SL = 1.225  # kg/m³ (ISA nivel del mar)
@@ -124,10 +144,20 @@ class Config:
     x_tubo_inicio: float = 2.60
     x_cabina_inicio: float = 6.15
     x_puerta_delantera: float = 5.55
-    x_salida_ala: float = 9.60
+    x_salida_off: float = 1.60  # salida sobre el ala, desde el borde de ataque
     long_cono: float = 4.80
     x_le_ht_off: float = 0.15  # desde fin de tubo
     x_le_vt_off: float = 1.20  # desde fin de tubo
+
+    # ------------------------------------------------------------ Balance/CG
+    pct_mac_min: float = 15.0  # % MAC límite delantero aceptable
+    pct_mac_max: float = 35.0  # % MAC límite trasero aceptable
+    n_pax_balance: int = 90  # pax para los casos de carga (rango 30–90)
+    kg_pax_solo: float = 80.0  # kg/pax sin equipaje (95 − 15)
+    kg_equipaje_pax: float = 15.0  # kg de equipaje por pax
+    vol_equipaje_pax: float = 0.05  # m³ de equipaje por pax
+    z_piso_cabina: float = -0.42  # piso de cabina sobre eje (m)
+    fr_util_bodega: float = 0.62  # fracción útil del segmento bajo el piso
 
     # Estaciones de motores y tren (en función de x_ac)
     y_motor: float = 4.75  # semisustentación de la góndola
@@ -178,6 +208,360 @@ def combustible(mtow: float, cfg: Config) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Pesos por componente (SUAVE), centro de gravedad y bodega de equipaje
+# ---------------------------------------------------------------------------
+# Orden de grupos para el reporte: (grupo, nombres de ítem)
+GRUPOS_ITEMS = (
+    ("Estructura", ("Fuselaje presurizado", "Ala", "Estabilizador horizontal",
+                    "Derivada vertical")),
+    ("Tren de aterrizaje", ("Tren principal", "Tren de nariz")),
+    ("Propulsión", ("Motores, hélices y góndolas",)),
+    ("Sistemas", ("Control de vuelo", "Hidráulica", "Aviónica", "Eléctrico",
+                  "Climatización", "Amueblado", "Sistema de combustible")),
+    ("Operativos", ("Tripulación", "Varios")),
+)
+
+_SUAVE_A_ITEM = {
+    "estructura_fuselaje": "Fuselaje presurizado",
+    "estructura_ala": "Ala",
+    "estructura_ht": "Estabilizador horizontal",
+    "estructura_vt": "Derivada vertical",
+    "tren_principal": "Tren principal",
+    "tren_nariz": "Tren de nariz",
+    "propulsion": "Motores, hélices y góndolas",
+    "sis_control": "Control de vuelo",
+    "sis_hidraulica": "Hidráulica",
+    "sis_avionica": "Aviónica",
+    "sis_electrico": "Eléctrico",
+    "sis_clima": "Climatización",
+    "sis_amueblado": "Amueblado",
+    "sis_combustible": "Sistema de combustible",
+}
+
+
+def _geo_suave(cfg: Config, r: dict) -> dict:
+    """Geometría/pesos en convergencia, en el formato que espera SUAVE."""
+    mojada = math.pi * cfg.d_fuselaje * r["l_fus"] * 0.92
+    return dict(
+        mtow=r["mtow"], comb_total=r["comb_total"], s_ala=r["area_ala"],
+        b=r["envergadura"], mac=r["mac"], c_root=r["c_root"],
+        lambda_wing=cfg.lambda_wing, barrido_le=cfg.barrido_le,
+        x_le_ala=r.get("x_le_ala", cfg.x_le_ala), x_ac=r["x_ac"],
+        x_le_ht=r["x_le_ht"], x_le_vt=r["x_le_vt"],
+        s_ht=r["s_ht"], b_ht=r["b_ht"], c_root_ht=r["c_root_ht"],
+        lambda_ht=cfg.lambda_ht,
+        s_vt=r["s_vt"], b_vt=r["b_vt"], c_root_vt=r["c_root_vt"],
+        lambda_vt=cfg.lambda_vt,
+        l_fus=r["l_fus"], d_fuselaje=cfg.d_fuselaje, mojada=mojada,
+        masa_grupo=r["masa_grupo"], n_motores=cfg.n_motores,
+        n_pax=cfg.n_pax_balance, n_asientos=cfg.n_pax,
+    )
+
+
+def desglose_oew(cfg: Config, r: dict) -> tuple[dict, dict]:
+    """
+    Desglose de pesos OEW por componente.
+
+    Intenta SUAVE (correlaciones General_Aviation / Raymer, con su
+    desglose de sistemas); su total se escala con un único factor para
+    reconciliar con el OEW de diseño (conservador, anclado a la familia
+    ATR72). Sin SUAVE, usa el desglose manual de respaldo.
+    Devuelve ({item: kg}, meta).
+    """
+    budget = r["oew"] - tripulacion(cfg) - cfg.m_misc
+    su = desglose_pesos(_geo_suave(cfg, r))
+    if su is not None:
+        su_items = {v: su[k] for k, v in _SUAVE_A_ITEM.items()}
+        bruto = sum(su_items.values())
+        # Solo la estructura (regresión de flota GA) se escala para
+        # cerrar contra el OEW de diseño: tren, propulsión y sistemas
+        # dependen directamente del MTOW y de inputs, van en valor SUAVE.
+        estructura = ("Fuselaje presurizado", "Ala",
+                      "Estabilizador horizontal", "Derivada vertical")
+        estr_raw = sum(su_items[n] for n in estructura)
+        resto_raw = bruto - estr_raw
+        k = max((budget - resto_raw) / estr_raw, 0.1)
+        masas = {
+            n: (m * k if n in estructura else m) for n, m in su_items.items()
+        }
+        meta = {
+            "fuente": "SUAVE 2.5.2 (correlaciones General_Aviation / Raymer)",
+            "k_escala": k,
+            "suave_raw": bruto,
+            "suave_disponible": True,
+            "nota_k": "aplicado solo a la estructura",
+        }
+    else:
+        mojada = math.pi * cfg.d_fuselaje * r["l_fus"] * 0.92
+        masas = {
+            "Fuselaje presurizado": cfg.k_fuselaje * mojada,
+            "Ala": cfg.k_ala * r["area_ala"],
+            "Estabilizador horizontal": cfg.k_empennaje * r["s_ht"],
+            "Derivada vertical": cfg.k_empennaje * r["s_vt"],
+            "Tren principal": 0.78 * cfg.f_tren * r["mtow"],
+            "Tren de nariz": 0.22 * cfg.f_tren * r["mtow"],
+            "Motores, hélices y góndolas": r["masa_grupo"],
+            "Control de vuelo": 0.28 * cfg.m_sistemas,
+            "Hidráulica": 0.10 * cfg.m_sistemas,
+            "Aviónica": 0.24 * cfg.m_sistemas,
+            "Eléctrico": 0.18 * cfg.m_sistemas,
+            "Climatización": 0.13 * cfg.m_sistemas,
+            "Sistema de combustible": 0.07 * cfg.m_sistemas,
+            "Amueblado": (cfg.kg_interior_pax * cfg.n_pax
+                          + cfg.m_interior_fijo),
+        }
+        meta = {
+            "fuente": "manual (respaldo: SUAVE no disponible)",
+            "k_escala": 1.0,
+            "suave_raw": None,
+            "suave_disponible": False,
+        }
+    masas["Tripulación"] = tripulacion(cfg)
+    masas["Varios"] = cfg.m_misc
+    return masas, meta
+
+
+def _ctx(cfg: Config, r: dict, masas: dict) -> dict:
+    """Constantes congeladas para evaluar el balance variando solo x_LE."""
+    return dict(
+        b=r["envergadura"], mac=r["mac"], c_root=r["c_root"],
+        c_root_ht=r["c_root_ht"], c_root_vt=r["c_root_vt"],
+        x_le_ht=r["x_le_ht"], x_le_vt=r["x_le_vt"],
+        x_tubo_inicio=cfg.x_tubo_inicio, x_tubo_fin=r["x_tubo_fin"],
+        rows=r["rows"], comb_total=r["comb_total"], masas=masas,
+        mtow=r["mtow"],
+    )
+
+
+def _x_ac(cfg: Config, x_le: float, b: float, mac: float) -> float:
+    return (x_le
+            + math.tan(math.radians(cfg.barrido_le)) * (b / 2) / 2
+            + mac / 4)
+
+
+def _estaciones(cfg: Config, ctx: dict, x_le: float) -> tuple[float, dict]:
+    """
+    Estaciones longitudinales de cada componente para una posición dada
+    del ala. Motores, tren (por desplazamiento de x_ac) y salidas sobre
+    el ala se desplazan con el ala.
+    """
+    b, mac = ctx["b"], ctx["mac"]
+    x_ac = _x_ac(cfg, x_le, b, mac)
+    tan_le = math.tan(math.radians(cfg.barrido_le))
+    x_prop = x_le + cfg.y_motor * tan_le - 1.0
+    x_grp = x_prop + 1.61  # cg del grupo (motor 2,0 / hélice 0,6 / góndola 1,8)
+    x_nose = x_ac - cfg.off_nose_gear
+    x_main = x_ac + cfg.off_main_gear
+    x_ti, x_tf = ctx["x_tubo_inicio"], ctx["x_tubo_fin"]
+    l_t, l_c = x_tf - x_ti, cfg.long_cono
+    x_fus = (l_t * (x_ti + x_tf) / 2 + 0.4 * l_c * (x_tf + l_c / 2)) / (
+        l_t + 0.4 * l_c)
+    x_ala = x_le + 0.6 * tan_le * (b / 2) + 0.42 * mac
+    x_ht = ctx["x_le_ht"] + 0.45 * ctx["c_root_ht"]
+    x_vt = ctx["x_le_vt"] + 0.40 * ctx["c_root_vt"]
+    x_av = x_ti + 2.20  # bahía de aviónica tras la cabina de pilotos
+    cabin_mid = (cfg.x_cabina_inicio
+                 + (ctx["rows"] - 1) / 2 * cfg.pitch + 0.45)
+    tr = tripulacion(cfg)
+    x_crew = (cfg.n_pilotos * cfg.masa_piloto * 4.0
+              + cfg.n_cabina * cfg.masa_cabina * 13.0) / tr
+    est = {
+        "Fuselaje presurizado": x_fus,
+        "Ala": x_ala,
+        "Estabilizador horizontal": x_ht,
+        "Derivada vertical": x_vt,
+        "Tren principal": x_main,
+        "Tren de nariz": x_nose,
+        "Motores, hélices y góndolas": x_grp,
+        "Control de vuelo": x_ac + 1.0,
+        "Hidráulica": x_ac,
+        "Aviónica": x_av,
+        "Eléctrico": x_ac + 1.5,
+        "Climatización": x_ac,
+        "Amueblado": cabin_mid,
+        "Sistema de combustible": x_ac,
+        "Tripulación": x_crew,
+        "Varios": x_ac,
+        "_x_ac": x_ac, "_cabin_mid": cabin_mid, "_x_nose": x_nose,
+        "_x_main": x_main,
+    }
+    return x_ac, est
+
+
+def _proyectar(c: float, dom: list, huecos: list) -> float:
+    """Proyecta c sobre dom evitando los intervalos huecos."""
+    a, b = dom
+
+    def inter(h):
+        return max(h[0], a), min(h[1], b)
+
+    validos = [h for h in huecos if inter(h)[0] <= inter(h)[1]]
+
+    def ok(p):
+        return not any(lo < p < hi for lo, hi in validos)
+
+    cands = [min(max(c, a), b)]
+    for lo, hi in validos:
+        cands += [lo, hi]
+    cands = [p for p in cands if ok(p)]
+    return min(cands, key=lambda p: abs(p - c))
+
+
+def _bodega(cfg: Config, ctx: dict, x_le: float, est: dict,
+            x_cg3: float) -> dict:
+    """
+    Dimensiona la bodega bajo el piso y la ubica lo más cerca posible de
+    x_cg3 (evita solo el pozo del tren de nariz; ala alta, la caja de
+    ala está en el techo del fuselaje, no en el piso, y el tren
+    principal es exterior en carenas).
+    """
+    R = cfg.d_fuselaje / 2
+    zf = cfg.z_piso_cabina
+    A = R * R * math.acos(zf / R) - zf * math.sqrt(R * R - zf * zf)
+    A_us = A * cfg.fr_util_bodega
+    V = cfg.n_pax_balance * cfg.vol_equipaje_pax
+    L = max(V / A_us, 0.8)
+    L = min(L, 0.55 * (ctx["x_tubo_fin"] - cfg.x_cabina_inicio))
+    x_nose = est["_x_nose"]
+    dom = [cfg.x_cabina_inicio - 1.5 + L / 2, ctx["x_tubo_fin"] - 0.6 - L / 2]
+    huecos = [
+        [x_nose - 1.0 - L / 2, x_nose + 1.0 + L / 2],
+    ]
+    centro = _proyectar(x_cg3, dom, huecos)
+    return {
+        "V": V, "L": L, "A_us": A_us, "A_seg": A,
+        "x0": centro - L / 2, "x1": centro + L / 2, "centro": centro,
+        "z0": zf, "z1": -(R - 0.12),
+        "masa_max": cfg.n_pax_balance * cfg.kg_equipaje_pax,
+    }
+
+
+def _evaluar_casos(cfg: Config, ctx: dict, est: dict,
+                   x_bodega: float) -> tuple[list, float]:
+    masas = ctx["masas"]
+    x_ac, cabin_mid = est["_x_ac"], est["_cabin_mid"]
+    x_mac_le = x_ac - ctx["mac"] / 4
+    base = [(masas[n], est[n]) for n in masas]
+    n = cfg.n_pax_balance
+    defs = [
+        ("1 · OEW (vacío, sin comb. ni pax)", []),
+        (f"2 · {n} pax sin equipaje",
+         [(n * cfg.kg_pax_solo, cabin_mid)]),
+        (f"3 · {n} pax + equipaje máx. + comb. lleno",
+         [(n * cfg.kg_pax_solo, cabin_mid),
+          (n * cfg.kg_equipaje_pax, x_bodega),
+          (ctx["comb_total"], x_ac)]),
+    ]
+    out = []
+    for nombre, extra in defs:
+        items = base + extra
+        w = sum(m for m, _ in items)
+        x = sum(m * xx for m, xx in items) / w
+        pct = 100 * (x - x_mac_le) / ctx["mac"]
+        viol = max(0.0, cfg.pct_mac_min - pct, pct - cfg.pct_mac_max)
+        out.append({"nombre": nombre, "peso": w, "x_cg": x, "pct": pct,
+                    "viol": viol})
+    return out, x_mac_le
+
+
+def evaluar_balance(cfg: Config, ctx: dict, x_le: float) -> dict:
+    """CG de los 3 casos + bodega, con iteración bodega ↔ CG."""
+    x_cg3, x_bod, res, bod, est = None, None, None, None, None
+    for _ in range(8):
+        _, est = _estaciones(cfg, ctx, x_le)
+        semilla = x_cg3 if x_cg3 is not None else est["_x_ac"]
+        bod = _bodega(cfg, ctx, x_le, est, semilla)
+        casos, x_mac_le = _evaluar_casos(cfg, ctx, est, bod["centro"])
+        x_cg3 = casos[2]["x_cg"]
+        res = {"casos": casos, "x_mac_le": x_mac_le, "bodega": bod,
+               "estaciones": est, "x_ac": est["_x_ac"]}
+        if x_bod is not None and abs(bod["centro"] - x_bod) < 1e-4:
+            break
+        x_bod = bod["centro"]
+    return res
+
+
+def _eval_x(cfg_base: Config, x: float):
+    """Evaluación completa (sizing + pesos + balance) para una x_LE."""
+    cf = replace(cfg_base, x_le_ala=round(x, 3))
+    rr = dimensionar(cfg=cf)
+    mm, mt = desglose_oew(cf, rr)
+    cx = _ctx(cf, rr, mm)
+    res = evaluar_balance(cf, cx, cf.x_le_ala)
+    marg = min(min(c["pct"] - cfg_base.pct_mac_min,
+                   cfg_base.pct_mac_max - c["pct"]) for c in res["casos"])
+    viol = max(c["viol"] for c in res["casos"])
+    clave = ((1, round(marg, 6)) if viol <= 1e-9
+             else (0, round(-viol, 6)))
+    estado = (cf, rr, mm, mt, cx, res, marg, viol)
+    return clave, estado
+
+
+def buscar_posicion_ala(cfg: Config) -> tuple[float, tuple]:
+    """
+    Barrido de x_LE con evaluación completa en cada candidato (cada
+    posición tiene sizing, colas por brazo, masas y balance propios).
+    Elige la posición que hace cumplir los 3 casos en 15–35 % MAC con
+    máximo margen; si ninguna los hace cumple, minimiza la violación.
+    Devuelve (x_LE*, estado_en_x*).
+    """
+    def barrer(xs, mejor):
+        for x in xs:
+            clave, estado = _eval_x(cfg, x)
+            if mejor is None or clave > mejor[0]:
+                mejor = (clave, x, estado)
+        return mejor
+
+    mejor = None
+    x = 8.0
+    while x <= 16.01:  # refinado grueso: paso 0,4 m
+        mejor = barrer([x], mejor)
+        x += 0.4
+    cx = mejor[1]
+    mejor = barrer([cx + dx for dx in
+                    [i * 0.08 for i in range(-5, 6)]], mejor)
+    cx = mejor[1]
+    mejor = barrer([cx + dx for dx in
+                    [i * 0.02 for i in range(-4, 5)]], mejor)
+    return mejor[1], mejor[2]
+
+
+def dimensionar_con_balance(cfg: Config | None = None) -> dict:
+    """
+    Dimensionamiento + desglose de pesos (SUAVE) + balance en 3 casos +
+    posición de ala iterada + bodega. Es la entrada que usan el reporte
+    y el modelo 3D.
+    """
+    cfg = cfg or Config()
+    x_base = cfg.x_le_ala
+
+    # Estado de referencia en la posición inicial (para reportar el
+    # movimiento y los CG previos)
+    r0 = dimensionar(cfg=cfg)
+    m0, meta0 = desglose_oew(cfg, r0)
+    res0 = evaluar_balance(cfg, _ctx(cfg, r0, m0), x_base)
+
+    x_star, estado = buscar_posicion_ala(cfg)
+    cf, r, masas, meta, _, res, _, _ = estado
+
+    if abs(x_star - x_base) < 0.02:
+        cf, r, masas, meta = cfg, r0, m0, meta0
+        res = res0
+
+    items = {n: (masas[n], res["estaciones"][n]) for n in masas}
+
+    r["x_le_ala"] = cf.x_le_ala
+    r["x_le_ala_base"] = x_base
+    r["mov_ala"] = cf.x_le_ala - x_base
+    r["pesos_items"] = items
+    r["pesos_meta"] = meta
+    r["balance"] = res
+    r["bodega"] = res["bodega"]
+    r["balance_base"] = res0
+    return r
+
+
+# ---------------------------------------------------------------------------
 # Geometría / dimensionamiento
 # ---------------------------------------------------------------------------
 def layout(cfg: Config) -> dict:
@@ -190,10 +574,11 @@ def layout(cfg: Config) -> dict:
 
     # Ventanillas: una por fila, ambas costados (excluye fila de salida ala)
     pitch = cfg.pitch
+    x_salida = cfg.x_le_ala + cfg.x_salida_off
     win = []
     for i in range(rows):
         x = cfg.x_cabina_inicio + 0.40 + i * pitch
-        if abs(x - cfg.x_salida_ala) < 0.45:
+        if abs(x - x_salida) < 0.45:
             continue  # fila ocupada por la salida de emergencia sobre el ala
         win.append(round(x, 2))
 
@@ -205,7 +590,7 @@ def layout(cfg: Config) -> dict:
         "l_fus": l_fus,
         "x_puerta_delantera": cfg.x_puerta_delantera,
         "x_puerta_trasera": round(x_tubo_fin - 0.65, 2),
-        "x_salida_ala": cfg.x_salida_ala,
+        "x_salida_ala": round(cfg.x_le_ala + cfg.x_salida_off, 2),
         "ventanillas_x": win,
     }
 
@@ -341,6 +726,7 @@ def dimensionar(mtow_inicial: float = 23000.0, cfg: Config | None = None) -> dic
         "mtow": mtow,
         "mlw": mlw,
         "oew": oew_final,
+        "x_le_ala": cfg.x_le_ala,
         "payload": carga_util(cfg),
         "comb_taxi": comb["taxi"],
         "comb_crucero": comb["crucero"],
@@ -398,8 +784,7 @@ def _rodaje(cfg, s, rho, w, cl_g, cd0, fraccion_potencia, vs,
         l = min(q * s * cl_g, w * 1.05)
         d = q * s * (cd0 + _cd_inducido(cl_g, cfg.aspecto, cfg.oswald))
         a = G * ((t - d) / w - cfg.mu_to * max(1.0 - l / w, 0.0))
-        if a <= 0.05:
-            a = 0.05
+        a = max(0.05, a)
         dist += v * dv / a
         v += dv
     return dist, v_lof
@@ -505,33 +890,50 @@ def imprimir_reporte(cfg: Config, r: dict) -> None:
           f"  {r['payload']:8.1f} kg")
     print(f"  Tripulación de vuelo/cabina          {tripulacion(cfg):8.1f} kg")
 
-    print("\nPesos")
-    print("  Desglose OEW:")
-    s_ala = r["area_ala"]
-    mojada = math.pi * cfg.d_fuselaje * r["l_fus"] * 0.92
-    comp = {
-        "Ala (estructura + controles)": cfg.k_ala * s_ala,
-        "Fuselaje presurizado": cfg.k_fuselaje * mojada,
-        "Empennaje": cfg.k_empennaje * (r["s_ht"] + r["s_vt"]),
-        "Tren retráctil": cfg.f_tren * r["mtow"],
-        "Grupo turbohélice (2×)": r["masa_grupo"],
-        "Sistemas y aviónica": cfg.m_sistemas,
-        "Interior": cfg.kg_interior_pax * cfg.n_pax + cfg.m_interior_fijo,
-        "Tripulación": tripulacion(cfg),
-        "Varios": cfg.m_misc,
-    }
-    for k, v in comp.items():
-        print(f"    {k:<36} {v:8.1f} kg")
-    print("  " + "—" * 44)
-    print(f"  Peso en vacío operativo (OEW)       {r['oew']:8.1f} kg "
-          f"({100 * r['oew'] / r['mtow']:.1f} % del MTOW)")
-    print(f"  Combustible taxi + ascenso          {r['comb_taxi']:8.1f} kg")
-    print(f"  Combustible de crucero              {r['comb_crucero']:8.1f} kg")
-    print(f"  Reserva: espera + desvío            "
+    print("\nDesglose de pesos por componente")
+    items = r.get("pesos_items")
+    meta = r.get("pesos_meta") or {}
+    if items:
+        print(f"  Método: {meta.get('fuente', 'n/d')}")
+        if meta.get("suave_raw"):
+            print(f"  Referencia SUAVE sin escala: {meta['suave_raw']:.1f} kg "
+                  f"· factor de escala de estructura ×{meta['k_escala']:.2f} "
+                  f"({meta.get('nota_k', '')})")
+        for grupo, nombres in GRUPOS_ITEMS:
+            print(f"  {grupo}:")
+            sub = 0.0
+            for n in nombres:
+                kg, x = items[n]
+                sub += kg
+                print(f"    {n:<30} {kg:8.1f} kg   x = {x:5.2f} m")
+            print(f"    {'Subtotal ' + grupo.lower():<30} {sub:8.1f} kg")
+        oew_sum = sum(m for m, _ in items.values())
+        print("  " + "—" * 50)
+        print(f"  {'Peso en vacío operativo (OEW)':<30} "
+              f"{oew_sum:8.1f} kg ({100 * oew_sum / r['mtow']:.1f} % MTOW)")
+    else:
+        print(f"  Peso en vacío operativo (OEW)       {r['oew']:8.1f} kg "
+              f"({100 * r['oew'] / r['mtow']:.1f} % del MTOW)")
+    print(f"  {'Combustible taxi + ascenso':<30} {r['comb_taxi']:8.1f} kg")
+    print(f"  {'Combustible de crucero':<30} {r['comb_crucero']:8.1f} kg")
+    print(f"  {'Reserva: espera + desvío':<30} "
           f"{r['comb_espera'] + r['comb_desvio']:8.1f} kg")
-    print(f"  Combustible total                   {r['comb_total']:8.1f} kg")
-    print(f"  MTOW                                {r['mtow']:8.1f} kg")
-    print(f"  MLW (peso máx. de aterrizaje)       {r['mlw']:8.1f} kg")
+    print(f"  {'Combustible total (tanque lleno)':<30} "
+          f"{r['comb_total']:8.1f} kg")
+    print(f"  {'MTOW (punto de diseño 72 pax)':<30} {r['mtow']:8.1f} kg")
+    print(f"  {'MLW (peso máx. de aterrizaje)':<30} {r['mlw']:8.1f} kg")
+    if items:
+        n = cfg.n_pax_balance
+        tot3 = (r["oew"] + r["comb_total"]
+                + n * (cfg.kg_pax_solo + cfg.kg_equipaje_pax))
+        print(f"  {f'Carga caso 3 ({n} pax)':<30} "
+              f"{n * (cfg.kg_pax_solo + cfg.kg_equipaje_pax):8.1f} kg")
+        nota = ""
+        if tot3 > r["mtow"]:
+            nota = (f"  ← excede MTOW en {tot3 - r['mtow']:.0f} kg "
+                    f"(envolvente de balance, no operable)")
+        print(f"  TOTAL caso 3 de carga (OEW+comb.+carga) "
+              f"{tot3:8.1f} kg{nota}")
 
     print("\nDimensiones")
     print(f"  Superficie alar (S)                 {r['area_ala']:8.1f} m²")
@@ -603,12 +1005,76 @@ def imprimir_reporte(cfg: Config, r: dict) -> None:
           "en el ala")
     print("  · Timón de profundidad (HT) y timón de dirección (VT), "
           "asistidos")
+
+    bal = r.get("balance")
+    if bal:
+        mac = r["mac"]
+        x_le_mac = bal["x_mac_le"]
+        print("\nCentro de gravedad — 3 casos de carga")
+        print(f"  Rango aceptable: {cfg.pct_mac_min:.0f}–"
+              f"{cfg.pct_mac_max:.0f} % de la MAC ({mac:.2f} m; ventana "
+              f"de {0.20 * mac:.2f} m)")
+        print(f"  Cuerda media: x = {x_le_mac:.2f} m (borde de ataque) "
+              f"→ {x_le_mac + mac:.2f} m (borde de fuga)")
+        print(f"  {'Caso':<46} {'Peso':>8} {'x_CG':>7} {'%MAC':>7}  Estado")
+        for c in bal["casos"]:
+            estado = "OK" if c["viol"] <= 1e-9 else "FUERA DE RANGO"
+            print(f"  {c['nombre']:<46} {c['peso']:8.0f} kg "
+                  f"{c['x_cg']:7.2f} {c['pct']:7.1f}  [{estado}]")
+        fuera = [c for c in bal["casos"] if c["viol"] > 1e-9]
+        if fuera:
+            for c in fuera:
+                lado = ("delantero" if c["pct"] < cfg.pct_mac_min
+                        else "trasero")
+                print(f"  ¡Atención! caso «{c['nombre']}» queda fuera "
+                      f"({c['pct']:.1f} % MAC, límite {lado}); posición "
+                      f"óptima del ala alcanzada en x_LE = "
+                      f"{r['x_le_ala']:.2f} m.")
+        b0 = r.get("balance_base")
+        if b0:
+            p0 = " / ".join(f"{c['pct']:.1f}" for c in b0["casos"])
+            fuera0 = any(c["viol"] > 1e-9 for c in b0["casos"])
+            print(f"  Posición inicial (x_LE = {r['x_le_ala_base']:.2f} m): "
+                  f"CG = {p0} % MAC"
+                  + (" — los 3 casos FUERA de rango" if fuera0
+                     else " — ya cumplían"))
+        mov = r.get("mov_ala", 0.0)
+        if abs(mov) < 0.02:
+            print(f"  Posición del ala: sin cambios "
+                  f"(x_LE = {r['x_le_ala']:.2f} m ya cumple en los 3 casos)")
+        else:
+            print(f"  Posición del ala ajustada: x_LE "
+                  f"{r['x_le_ala_base']:.2f} → {r['x_le_ala']:.2f} m "
+                  f"(Δ = {mov:+.2f} m); motores, tren y salidas sobre el "
+                  f"ala se desplazaron con el ala")
+        print("  Nota: los casos 2 y 3 se evalúan sin combustible / con "
+              "tanque lleno según la definición de cada caso; el caso 3 "
+              "es envolvente de balance (no requiere operar a ese peso).")
+
+    bod = r.get("bodega")
+    if bod:
+        n = cfg.n_pax_balance
+        print("\nBodega de equipaje (bajo el piso de la cabina)")
+        print(f"  Volumen requerido: {bod['V']:.1f} m³ "
+              f"({n} pax × {cfg.vol_equipaje_pax:.2f} m³/pax) · masa máx. "
+              f"{bod['masa_max']:.0f} kg (15 kg/pax)")
+        print(f"  Sección útil bajo el piso: {bod['A_seg']:.2f} m² "
+              f"(Ø {cfg.d_fuselaje:.2f} m, piso z = {bod['z0']:.2f} m) × "
+              f"útil {cfg.fr_util_bodega * 100:.0f} % = {bod['A_us']:.2f} m²")
+        print(f"  Posición: x = {bod['x0']:.2f} → {bod['x1']:.2f} m "
+              f"(centro {bod['centro']:.2f} m), z = {bod['z1']:.2f} → "
+              f"{bod['z0']:.2f} m · longitud {bod['L']:.2f} m")
+        if bal:
+            cg3 = bal["casos"][2]["x_cg"]
+            print(f"  Brazo respecto al CG del caso 3 (x = {cg3:.2f} m): "
+                  f"{bod['centro'] - cg3:+.2f} m — minimiza el efecto de "
+                  f"cargar/descargar equipaje")
     print(linea)
 
 
 def main() -> None:
     cfg = Config()
-    r = dimensionar(cfg=cfg)
+    r = dimensionar_con_balance(cfg=cfg)
     imprimir_reporte(cfg, r)
 
 

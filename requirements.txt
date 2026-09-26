@@ -3,3 +3,6 @@ openmdao
 openaerostruct
 openconcept
 plotly
+ruff
+# SUAVE (desglose de pesos): git clone https://github.com/suavecode/SUAVE.git
+#   cd SUAVE/trunk && pip install --no-build-isolation -e .

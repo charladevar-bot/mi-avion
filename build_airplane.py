@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Construye el objeto ``asb.Airplane`` de AeroSandbox del avión regional
 turbohélice (2× motores en el ala alta, 72 pax, fuselaje presurizado,
@@ -22,15 +21,14 @@ import os
 import matplotlib
 
 matplotlib.use("Agg")  # backend sin display
+import aerosandbox as asb
+import aerosandbox.tools.pretty_plots as p
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import to_rgba
-from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-import aerosandbox as asb
-import aerosandbox.tools.pretty_plots as p
-
-from sizing_regional import Config, dimensionar
+from sizing_regional import Config, dimensionar_con_balance
 
 RENDER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders")
 PNG_PATH = os.path.join(RENDER_DIR, "airplane_3view.png")
@@ -48,6 +46,7 @@ C_GLASS = "#1F3B57"  # ventanillas y cabina de vuelo
 C_LINE_CTRL = "#27313B"  # líneas de superficies de control
 C_LINE_DOOR = "#111111"  # puertas y salidas
 C_LINE_PROP = "#7A828A"  # disco de hélice
+C_LINE_HOLD = "#A05A00"  # bodega de equipaje (contorno y etiqueta)
 
 # Geometría de línea (z = 0 es el eje del fuselaje; suelo en z = -2.25)
 Z_SUELO = -2.25
@@ -63,7 +62,6 @@ Z_MOTOR = 0.95  # eje de hélice (sale de sizing: cfg.z_motor)
 def build_airplane(r: dict, cfg: Config) -> asb.Airplane:
     """Arma el asb.Airplane con las dimensiones de sizing_regional.py."""
     d = cfg.d_fuselaje
-    half_d = d / 2
     x_tubo = r["x_tubo_fin"]
     l_fus = r["l_fus"]
 
@@ -119,7 +117,8 @@ def build_airplane(r: dict, cfg: Config) -> asb.Airplane:
 
     # ------------------------------------------------------------ góndolas
     y_m = cfg.y_motor
-    x_le_nac = cfg.x_le_ala + y_m * math.tan(math.radians(cfg.barrido_le))
+    x_le_ala = r["x_le_ala"]  # posición final del ala (iterada por balance)
+    x_le_nac = x_le_ala + y_m * math.tan(math.radians(cfg.barrido_le))
     x_prop = x_le_nac - 1.0  # plano de la hélice
     gon = []
     for side in (1, -1):
@@ -175,12 +174,12 @@ def build_airplane(r: dict, cfg: Config) -> asb.Airplane:
         color=C_WING,
         xsecs=[
             asb.WingXSec(
-                xyz_le=[cfg.x_le_ala, 0.0, Z_ALA],
+                xyz_le=[x_le_ala, 0.0, Z_ALA],
                 chord=c_root, twist=0.0, airfoil=af,
             ),
             asb.WingXSec(
                 xyz_le=[
-                    cfg.x_le_ala + half_b * tan_le,
+                    x_le_ala + half_b * tan_le,
                     half_b,
                     Z_ALA + half_b * tan_dih,
                 ],
@@ -311,7 +310,7 @@ def prop_meshes(r: dict, cfg: Config):
     """Palas de las hélices de 6 palas (Ø de cfg.diam_helice)."""
     out = []
     y_m, z_m = cfg.y_motor, Z_MOTOR
-    x_le_nac = cfg.x_le_ala + y_m * math.tan(math.radians(cfg.barrido_le))
+    x_le_nac = r["x_le_ala"] + y_m * math.tan(math.radians(cfg.barrido_le))
     x_prop = x_le_nac - 1.0
     rad = cfg.diam_helice / 2
     beta = math.radians(25.0)
@@ -429,7 +428,7 @@ def control_lines(r: dict, cfg: Config):
             - 0.1015 * x**4
         )
 
-    x_le, z_le = cfg.x_le_ala, Z_ALA
+    x_le, z_le = r["x_le_ala"], Z_ALA
     b2 = r["envergadura"] / 2
     tan_le = math.tan(math.radians(cfg.barrido_le))
     tan_dih = math.tan(math.radians(cfg.diedro))
@@ -486,7 +485,7 @@ def control_lines(r: dict, cfg: Config):
 
 def prop_disk_lines(r: dict, cfg: Config):
     """Círculo del disco barrido de cada hélice."""
-    x_le_nac = cfg.x_le_ala + cfg.y_motor * math.tan(
+    x_le_nac = r["x_le_ala"] + cfg.y_motor * math.tan(
         math.radians(cfg.barrido_le)
     )
     x_prop = x_le_nac - 1.0
@@ -530,13 +529,41 @@ def full_meshes(ap, r: dict, cfg: Config):
     return out
 
 
+def hold_lines(r: dict, cfg: Config):
+    """Prisma de la bodega de equipaje bajo el piso (12 aristas)."""
+    bod = r.get("bodega")
+    if not bod:
+        return []
+    R = cfg.d_fuselaje / 2
+    x0, x1 = bod["x0"], bod["x1"]
+    z0, z1 = bod["z0"], bod["z1"]
+    w0 = 0.94 * math.sqrt(max(R * R - z0 * z0, 0.04))
+    w1 = 0.94 * math.sqrt(max(R * R - z1 * z1, 0.04))
+    v = {}
+    for tag, x in (("0", x0), ("1", x1)):
+        v["a" + tag] = (x, w0, z0)   # piso, costado +
+        v["b" + tag] = (x, -w0, z0)  # piso, costado −
+        v["c" + tag] = (x, -w1, z1)  # panza, costado −
+        v["d" + tag] = (x, w1, z1)   # panza, costado +
+    edges = [
+        ("a0", "b0"), ("b0", "c0"), ("c0", "d0"), ("d0", "a0"),
+        ("a1", "b1"), ("b1", "c1"), ("c1", "d1"), ("d1", "a1"),
+        ("a0", "a1"), ("b0", "b1"), ("c0", "c1"), ("d0", "d1"),
+    ]
+    return [np.array([v[p], v[q]]) for p, q in edges]
+
+
 def line_groups(r: dict, cfg: Config):
     """Grupos de líneas: (segmentos, color, dash, nombre)."""
+    bod = r.get("bodega")
+    nombre_bod = ("Bodega de equipaje"
+                  + (f" ({bod['V']:.1f} m³)" if bod else ""))
     return [
         (control_lines(r, cfg), C_LINE_CTRL, "dash",
          "Superficies de control"),
         (door_lines(r, cfg), C_LINE_DOOR, "solid", "Puertas y salidas"),
         (prop_disk_lines(r, cfg), C_LINE_PROP, "dot", "Disco de hélice"),
+        (hold_lines(r, cfg), C_LINE_HOLD, "dashdot", nombre_bod),
     ]
 
 
@@ -582,11 +609,29 @@ def save_three_view(ap, r: dict, cfg: Config, path: str) -> None:
             alpha=1.0, shade=True, zsort="average",
         ))
         for segs, color, dash, _ in groups:
-            style = {"solid": "-", "dash": "--", "dot": ":"}[dash]
+            style = {"solid": "-", "dash": "--", "dot": ":",
+                     "dashdot": "-."}[dash]
             for seg in segs:
                 ax.plot(seg[:, 0], seg[:, 1], seg[:, 2],
                         color=color, linestyle=style, linewidth=1.1,
                         zorder=5)
+
+        if title == "Perfil" and r.get("bodega"):
+            # Etiqueta de la bodega con línea guía (vista lateral)
+            bod = r["bodega"]
+            xt, zt = bod["x0"] - 2.6, -1.95
+            ax.plot([xt + 1.9, bod["x0"] + 0.1], [0, 0],
+                    [zt + 0.10, bod["z1"]],
+                    color=C_LINE_HOLD, linewidth=0.8, zorder=6)
+            ax.text(
+                xt, 0, zt,
+                f"Bodega de equipaje\n{bod['V']:.1f} m³ "
+                f"(x {bod['x0']:.1f}–{bod['x1']:.1f} m)",
+                color=C_LINE_HOLD, fontsize=7.5, fontweight="bold",
+                ha="left", va="center",
+                bbox=dict(fc="white", ec="none", alpha=0.8, pad=1.2),
+                zorder=6,
+            )
 
         ax.set_xlim(mins[0], maxs[0])
         ax.set_ylim(mins[1], maxs[1])
@@ -633,6 +678,13 @@ def save_three_view(ap, r: dict, cfg: Config, path: str) -> None:
             "Fuselaje presurizado Ø2,87 m (18 filas 2+2) · ala alta con "
             "slats, flaps, ailerones y spoilers · 2 hélices de 6 palas · "
             "tren triciclo retráctil · 4 puertas + 2 salidas sobre el ala"
+            + (
+                f" · bodega {r['bodega']['V']:.1f} m³ bajo el piso · "
+                f"CG {min(c['pct'] for c in r['balance']['casos']):.1f}–"
+                f"{max(c['pct'] for c in r['balance']['casos']):.1f} % MAC "
+                f"(rango 15–35)"
+                if r.get("bodega") and r.get("balance") else ""
+            )
         ),
         ha="center", fontsize=9.5, color="dimgray",
     )
@@ -667,8 +719,9 @@ def save_interactive_html(ap, r: dict, cfg: Config, path: str) -> None:
                            "<extra>%{fullData.name}</extra>"),
         ))
 
-    # Líneas (superficies de control, puertas, discos)
-    dash_map = {"dash": "dash", "solid": "solid", "dot": "dot"}
+    # Líneas (superficies de control, puertas, discos, bodega)
+    dash_map = {"dash": "dash", "solid": "solid", "dot": "dot",
+                "dashdot": "dashdot"}
     for segs, color, dash, name in line_groups(r, cfg):
         for k, seg in enumerate(segs):
             fig.add_trace(go.Scatter3d(
@@ -692,6 +745,11 @@ def save_interactive_html(ap, r: dict, cfg: Config, path: str) -> None:
             f"{ap.name} — 3D interactivo: rotá con el mouse · "
             f"MTOW ≈ {r['mtow']:.0f} kg · b = {r['envergadura']:.2f} m · "
             f"L = {r['l_fus']:.2f} m"
+            + (
+                f" · CG {min(c['pct'] for c in r['balance']['casos']):.1f}–"
+                f"{max(c['pct'] for c in r['balance']['casos']):.1f} % MAC"
+                if r.get("balance") else ""
+            )
         ),
         scene=dict(
             aspectmode="data",
@@ -710,7 +768,7 @@ def save_interactive_html(ap, r: dict, cfg: Config, path: str) -> None:
 
 def main() -> None:
     cfg = Config()
-    r = dimensionar(cfg=cfg)
+    r = dimensionar_con_balance(cfg=cfg)
     ap = build_airplane(r, cfg)
 
     w = ap.wings[0]
@@ -726,6 +784,12 @@ def main() -> None:
           f"{r['prestaciones']['SABE']['vs_ld_mlw'] * 1.94384:.0f} kt · "
           f"despegue OEI {r['prestaciones']['SABE']['tofl_oei']:.0f} m "
           f"/ aterrizaje {r['prestaciones']['SABE']['ld_total']:.0f} m")
+    if r.get("balance"):
+        pcts = " / ".join(f"{c['pct']:.1f}" for c in r["balance"]["casos"])
+        bod = r["bodega"]
+        print(f"  CG (3 casos): {pcts} % MAC (rango 15–35) · ala x_LE = "
+              f"{r['x_le_ala']:.2f} m (Δ {r['mov_ala']:+.2f} m) · bodega "
+              f"{bod['V']:.1f} m³ en x {bod['x0']:.2f}–{bod['x1']:.2f} m")
 
     os.makedirs(RENDER_DIR, exist_ok=True)
     save_three_view(ap, r, cfg, PNG_PATH)
